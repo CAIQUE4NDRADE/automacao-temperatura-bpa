@@ -1,0 +1,25 @@
+{
+    "planilha": {
+        "caminho": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura\\Atualiza Temperatura BPA rev2.xlsm",
+        "macro": "Extrai_Atualiza",
+        "celulas": {
+            "S10":      {"temp": "H7", "dens": "I7"},
+            "S500":     {"temp": "H8", "dens": "I8"},
+            "GASOLINA": {"temp": "H9", "dens": "I9"}
+        }
+    },
+    "email": {
+        "remetente": "pfpl@ipiranga.com.br",
+        "pasta_outlook": "Caixa de Entrada",
+        "pasta_download": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura\\PDFs"
+    },
+    "newsat": {
+        "url": "https://bpa.newsat.cosan.rede/Home",
+        "pasta_download": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura"
+    },
+    "automacao": {
+        "intervalo_minutos": 30,
+        "hora_reset_log": "00:00",
+        "pasta_log": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura\\Logs"
+    }
+}
