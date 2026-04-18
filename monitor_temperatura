@@ -1,0 +1,1263 @@
+"""
+AUTOMAÇÃO DE TEMPERATURA - RAÍZEN BPA
+Monitora email, baixa PDF e DiaryLoadAutoTank, preenche planilha e roda macro SAP.
+Ciclo: a cada 30 minutos. Reset de log: meia-noite.
+
+Melhorias v8:
+- Perfil fixo do Chrome (sem incógnito) — sessão persiste após suspensão/reinício
+- detach=True — Chrome sobrevive mesmo se o Python travar
+- Kill de processo Chrome órfão antes de criar nova instância (evita conflito de perfil)
+- Reconexão automática do Chrome no keep-alive
+- Detecção de retorno da suspensão no loop principal
+- Retry com backoff na criação do driver
+- Navegação forçada para URL do relatório no início de cada ciclo
+- Flag _macro_rodando para evitar interferência do keep-alive SAP durante a macro
+- Verificação de tela SAP antes do keep-alive — não interrompe operação do usuário
+- Planilha fixada pelo nome exato — evita conflito com outras planilhas abertas
+- Loop principal blindado — nunca fecha por qualquer erro
+- SAP preparado na ZO3C2 antes de acionar a macro — mesmo estado do uso manual
+- Sem raise no retry da macro — evita execuções repetidas em cascata
+- Limpeza de jobs atrasados após cada ciclo — evita acúmulo de execuções
+"""
+
+import os
+import json
+import time
+import logging
+import shutil
+import schedule
+import subprocess
+import threading
+import requests
+import tkinter as tk
+from tkinter import scrolledtext, font as tkfont
+from datetime import datetime, date
+from pathlib import Path
+
+import pdfplumber
+import win32com.client
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+# ── Usuário do Windows atual ──────────────────────────────────────────────────
+import getpass
+import ctypes
+import msvcrt
+USUARIO_WINDOWS = getpass.getuser()
+
+# ── Lock de instância única — impede rodar o programa duas vezes ──────────────
+_lock_file = None
+
+def _garantir_instancia_unica():
+    """
+    Cria um arquivo de lock para garantir que apenas uma instância rode por vez.
+    Se já houver uma instância rodando, exibe aviso e encerra.
+    """
+    global _lock_file
+    lock_path = BASE_DIR / "monitor.lock"
+    try:
+        _lock_file = open(lock_path, 'w')
+        msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        _lock_file.write(str(os.getpid()))
+        _lock_file.flush()
+    except Exception:
+        print("=" * 50)
+        print("  AVISO: O programa já está rodando!")
+        print("  Feche a outra janela antes de abrir nova.")
+        print("=" * 50)
+        import sys
+        sys.exit(1)
+
+# ── Impede suspensão do Windows enquanto o programa estiver rodando ───────────
+def _impedir_suspensao():
+    """
+    Usa powercfg para desativar a suspensão do sistema completamente.
+    Mais confiável que SetThreadExecutionState pois funciona mesmo durante sleep().
+    """
+    try:
+        # Desativa suspensão do sistema via powercfg
+        subprocess.run(
+            ["powercfg", "/change", "standby-timeout-ac", "0"],
+            capture_output=True, timeout=5
+        )
+        subprocess.run(
+            ["powercfg", "/change", "standby-timeout-dc", "0"],
+            capture_output=True, timeout=5
+        )
+        # Também usa SetThreadExecutionState como camada extra
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            0x80000000 | 0x00000001 | 0x00000002
+        )
+        logging.info("  Sistema configurado para não suspender enquanto o programa rodar.")
+    except Exception as e:
+        logging.warning(f"  Não foi possível impedir suspensão: {e}")
+
+def _liberar_suspensao():
+    """Restaura timeout de suspensão padrão do Windows (20 min) ao encerrar."""
+    try:
+        subprocess.run(
+            ["powercfg", "/change", "standby-timeout-ac", "20"],
+            capture_output=True, timeout=5
+        )
+        subprocess.run(
+            ["powercfg", "/change", "standby-timeout-dc", "10"],
+            capture_output=True, timeout=5
+        )
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+    except Exception:
+        pass
+
+# ── Carrega configurações ──────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent
+with open(BASE_DIR / "config.json", encoding="utf-8") as f:
+    CFG = json.load(f)
+
+def _substituir_usuario(obj):
+    if isinstance(obj, str):
+        return obj.replace("{usuario}", USUARIO_WINDOWS)
+    elif isinstance(obj, dict):
+        return {k: _substituir_usuario(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_substituir_usuario(i) for i in obj]
+    return obj
+
+CFG = _substituir_usuario(CFG)
+
+# ── Nome exato da planilha de temperatura — evita conflito com outras abertas ─
+NOME_PLANILHA = "Atualiza Temperatura BPA rev2.xlsm"
+
+# ── Pastas necessárias ─────────────────────────────────────────────────────────
+for pasta in [
+    CFG["email"]["pasta_download"],
+    CFG["newsat"]["pasta_download"],
+    CFG["automacao"]["pasta_log"],
+]:
+    Path(pasta).mkdir(parents=True, exist_ok=True)
+
+# ── Logger ─────────────────────────────────────────────────────────────────────
+def configurar_logger():
+    pasta_log = Path(CFG["automacao"]["pasta_log"])
+    arquivo_log = pasta_log / f"temperatura_{date.today().strftime('%Y%m%d')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(arquivo_log, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+
+configurar_logger()
+log = logging.getLogger(__name__)
+
+# ── Flag global: impede keep-alive SAP de interferir durante a macro ──────────
+_macro_rodando = False
+
+# ── Configuração Telegram ─────────────────────────────────────────────────────
+TELEGRAM_TOKEN = "8741198420:AAEahEmZQAlMW1fmcl-8stT7BZPJMj4xeMs"
+TELEGRAM_CHAT_ID = "6498919246"
+
+def _enviar_telegram(msg: str):
+    """Envia mensagem no Telegram de forma assíncrona — nunca bloqueia."""
+    def _enviar():
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        except Exception:
+            pass
+    threading.Thread(target=_enviar, daemon=True).start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1. OUTLOOK — baixar PDF do email pfpl@ipiranga.com.br
+# ══════════════════════════════════════════════════════════════════════════════
+ASSUNTOS_TEMPERATURA = ["ABERTURA", "Virada", "Atualiza"]
+
+def _buscar_pdfs_em_pasta(pasta_outlook, pasta_dest: Path) -> list[str]:
+    pdfs_baixados = []
+    try:
+        mensagens = pasta_outlook.Items
+        mensagens.Sort("[ReceivedTime]", True)
+        for msg in mensagens:
+            try:
+                if msg.UnRead is False:
+                    continue
+                assunto = getattr(msg, "Subject", "")
+                if not any(p.lower() in assunto.lower() for p in ASSUNTOS_TEMPERATURA):
+                    continue
+                for anexo in msg.Attachments:
+                    nome = anexo.FileName
+                    if nome.lower().endswith(".pdf"):
+                        destino = pasta_dest / nome
+                        anexo.SaveAsFile(str(destino))
+                        log.info(f"  PDF baixado: {nome} (assunto: {assunto[:50]})")
+                        pdfs_baixados.append(str(destino))
+                msg.UnRead = False
+                msg.Save()
+            except Exception as e:
+                log.warning(f"  Erro ao processar mensagem: {e}")
+    except Exception as e:
+        log.warning(f"  Erro ao varrer pasta: {e}")
+    return pdfs_baixados
+
+
+def _encontrar_pasta_outlook(namespace, nome_parcial: str):
+    def buscar_recursivo(pasta):
+        try:
+            if nome_parcial.lower() in pasta.Name.lower():
+                return pasta
+            for sub in pasta.Folders:
+                resultado = buscar_recursivo(sub)
+                if resultado:
+                    return resultado
+        except Exception:
+            pass
+        return None
+
+    for conta in namespace.Folders:
+        resultado = buscar_recursivo(conta)
+        if resultado:
+            return resultado
+    return None
+
+
+def baixar_pdf_outlook() -> list[str]:
+    log.info("Verificando emails de controle de qualidade...")
+    pdfs_baixados = []
+    pasta_dest = Path(CFG["email"]["pasta_download"])
+
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        namespace = outlook.GetNamespace("MAPI")
+
+        try:
+            inbox = namespace.GetDefaultFolder(6)
+            mensagens = inbox.Items
+            mensagens.Sort("[ReceivedTime]", True)
+            remetente_cfg = CFG["email"]["remetente"].lower()
+            for msg in mensagens:
+                try:
+                    if msg.UnRead is False:
+                        continue
+                    remetente = getattr(msg, "SenderEmailAddress", "").lower()
+                    if remetente_cfg not in remetente:
+                        continue
+                    for anexo in msg.Attachments:
+                        nome = anexo.FileName
+                        if nome.lower().endswith(".pdf"):
+                            destino = pasta_dest / nome
+                            anexo.SaveAsFile(str(destino))
+                            log.info(f"  PDF baixado (pfpl): {nome}")
+                            pdfs_baixados.append(str(destino))
+                    msg.UnRead = False
+                    msg.Save()
+                except Exception as e:
+                    log.warning(f"  Erro mensagem pfpl: {e}")
+        except Exception as e:
+            log.warning(f"  Erro Caixa de Entrada: {e}")
+
+        pasta_virada = _encontrar_pasta_outlook(namespace, "VIRADA")
+        if pasta_virada:
+            log.info(f"  Varrendo pasta: {pasta_virada.Name}")
+            novos = _buscar_pdfs_em_pasta(pasta_virada, pasta_dest)
+            pdfs_baixados.extend(novos)
+        else:
+            log.warning("  Pasta VIRADA/ABERTURA não encontrada no Outlook.")
+
+    except Exception as e:
+        log.error(f"Erro ao acessar Outlook: {e}")
+
+    return pdfs_baixados
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2. PDF — extrair temperatura e densidade por produto
+# ══════════════════════════════════════════════════════════════════════════════
+MAPA_PRODUTO = {
+    "S10":      "S10",
+    "S500":     "S500",
+    "GASOLINA": "GASOLINA",
+    "GAS":      "GASOLINA",
+}
+
+def extrair_dados_pdf(caminho_pdf: str) -> dict:
+    dados = {}
+    try:
+        with pdfplumber.open(caminho_pdf) as pdf:
+            for page in pdf.pages:
+                tabelas = page.extract_tables()
+                for tabela in tabelas:
+                    for linha in tabela:
+                        if not linha or len(linha) < 7:
+                            continue
+                        produto_raw = str(linha[1]).strip().upper() if linha[1] else ""
+                        produto = MAPA_PRODUTO.get(produto_raw)
+                        if not produto:
+                            continue
+                        try:
+                            temp = float(str(linha[6]).replace(",", ".").strip())
+                            dens = float(str(linha[5]).replace(",", ".").strip())
+                            dados[produto] = {"temp": temp, "dens": dens}
+                            log.info(f"  PDF → {produto}: temp={temp} dens={dens}")
+                        except (ValueError, TypeError):
+                            log.warning(f"  Não foi possível converter dados de {produto_raw}")
+    except Exception as e:
+        log.error(f"Erro ao ler PDF {caminho_pdf}: {e}")
+    return dados
+
+
+def processar_todos_pdfs(lista_pdfs: list[str]) -> dict:
+    consolidado = {}
+    for pdf in lista_pdfs:
+        dados = extrair_dados_pdf(pdf)
+        consolidado.update(dados)
+    return consolidado
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3. NEW SAT — download do DiaryLoadAutoTank
+# ══════════════════════════════════════════════════════════════════════════════
+COOKIES_FILE = BASE_DIR / "newsat_cookies.json"
+URL_RELATORIO = "https://bpa.newsat.cosan.rede/Report/DiaryLoadAutoTank"
+_driver_global = None
+
+PERFIL_CHROME = BASE_DIR / "chrome_profile"
+PERFIL_CHROME.mkdir(exist_ok=True)
+
+
+def _matar_chrome_orfao():
+    try:
+        resultado = subprocess.run(
+            ["wmic", "process", "where",
+             f"name='chrome.exe' and commandline like '%chrome_profile%'",
+             "get", "processid", "/format:value"],
+            capture_output=True, text=True, timeout=5
+        )
+        pids = [
+            line.replace("ProcessId=", "").strip()
+            for line in resultado.stdout.splitlines()
+            if line.startswith("ProcessId=") and line.strip() != "ProcessId="
+        ]
+        if pids:
+            for pid in pids:
+                subprocess.run(["taskkill", "/F", "/PID", pid],
+                               capture_output=True, timeout=5)
+                log.info(f"  Chrome órfão encerrado (PID {pid}).")
+            time.sleep(2)
+    except Exception as e:
+        log.warning(f"  Não foi possível encerrar Chrome órfão: {e}")
+
+
+def _criar_driver(pasta_download: Path):
+    chrome_options = Options()
+    chrome_options.add_argument(f"--user-data-dir={PERFIL_CHROME}")
+    chrome_options.add_argument("--profile-directory=Default")
+    chrome_options.add_experimental_option("detach", True)
+    chrome_options.add_experimental_option("prefs", {
+        "download.default_directory": str(pasta_download),
+        "download.prompt_for_download": False,
+        "download.directory_upgrade": True,
+        "safebrowsing.enabled": False,
+        "safebrowsing.disable_download_protection": True,
+        "profile.default_content_settings.popups": 0,
+        "profile.default_content_setting_values.automatic_downloads": 1,
+    })
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--window-size=1920,1080")
+    chrome_options.add_argument("--disable-popup-blocking")
+    chrome_options.add_argument("--safebrowsing-disable-download-protection")
+
+    from webdriver_manager.chrome import ChromeDriverManager
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=chrome_options)
+    driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+        "behavior": "allow",
+        "downloadPath": str(pasta_download)
+    })
+    return driver
+
+
+def _criar_driver_com_retry(pasta_download: Path, tentativas: int = 3):
+    for i in range(tentativas):
+        try:
+            return _criar_driver(pasta_download)
+        except Exception as e:
+            log.warning(f"  Falha ao criar Chrome (tentativa {i+1}/{tentativas}): {e}")
+            if i == 0:
+                log.info("  Verificando e encerrando Chrome órfão...")
+                _matar_chrome_orfao()
+            time.sleep(5)
+    log.error("  Não foi possível criar o Chrome após todas as tentativas.")
+    return None
+
+
+def _salvar_cookies(driver):
+    cookies = driver.get_cookies()
+    COOKIES_FILE.write_text(json.dumps(cookies), encoding="utf-8")
+    log.info(f"  Cookies salvos em {COOKIES_FILE}")
+
+
+def _ja_logado(driver) -> bool:
+    return (
+        "login" not in driver.current_url.lower()
+        and "microsoftonline" not in driver.current_url.lower()
+    )
+
+
+def _aguardar_login_manual(driver) -> bool:
+    log.warning("  Sessão expirada. Aguardando login manual no Chrome...")
+    log.warning("  >>> FAÇA O LOGIN NO CHROME QUE ABRIU E AGUARDE <<<")
+    for _ in range(36):
+        time.sleep(5)
+        if _ja_logado(driver):
+            log.info("  Login detectado!")
+            _salvar_cookies(driver)
+            return True
+    log.error("  Timeout no login manual.")
+    return False
+
+
+def _garantir_driver(pasta_dest: Path):
+    global _driver_global
+
+    if _driver_global is not None:
+        try:
+            _ = _driver_global.title
+        except Exception:
+            log.warning("  Chrome estava morto. Recriando...")
+            _driver_global = None
+
+    if _driver_global is None:
+        driver = _criar_driver_com_retry(pasta_dest)
+        if driver is None:
+            return None
+        _driver_global = driver
+        log.info("  Novo Chrome criado com perfil fixo.")
+
+    try:
+        _driver_global.get(URL_RELATORIO)
+        time.sleep(3)
+        if not _ja_logado(_driver_global):
+            sucesso = _aguardar_login_manual(_driver_global)
+            if not sucesso:
+                _driver_global = None
+                return None
+            _driver_global.get(URL_RELATORIO)
+            time.sleep(3)
+    except Exception as e:
+        log.error(f"  Erro ao navegar para o relatório: {e}")
+        _driver_global = None
+        return None
+
+    return _driver_global
+
+
+def baixar_diary_newsat() -> str | None:
+    global _driver_global
+    log.info("Acessando New SAT para baixar DiaryLoadAutoTank...")
+    pasta_dest = Path(CFG["newsat"]["pasta_download"])
+    arquivo_esperado = pasta_dest / "DiaryLoadAutoTank.xlsx"
+
+    if arquivo_esperado.exists():
+        arquivo_esperado.unlink()
+
+    driver = _garantir_driver(pasta_dest)
+    if driver is None:
+        log.error("  Chrome indisponível. Abortando download.")
+        return None
+
+    try:
+        wait = WebDriverWait(driver, 60)
+
+        log.info("  Logado no New SAT.")
+
+        log.info("  Navegando para o relatório...")
+        driver.get(URL_RELATORIO)
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(5)
+
+        driver.save_screenshot(str(BASE_DIR / "newsat_apos_login.png"))
+        log.info(f"  URL atual: {driver.current_url}")
+
+        btn_pesquisar = wait.until(EC.element_to_be_clickable((By.ID, "btn-search")))
+        btn_pesquisar.click()
+        log.info("  Clicou em Pesquisar.")
+
+        log.info("  Aguardando iframe do relatório...")
+        wait.until(EC.presence_of_element_located((By.XPATH, "//iframe | //frame")))
+        time.sleep(8)
+
+        driver.save_screenshot(str(BASE_DIR / "newsat_resultados.png"))
+        log.info("  Resultados carregados.")
+
+        iframes = driver.find_elements(By.XPATH, "//iframe | //frame")
+        log.info(f"  Encontrou {len(iframes)} iframe(s).")
+        entrou_iframe = False
+        for iframe in iframes:
+            try:
+                driver.switch_to.frame(iframe)
+                btns = driver.find_elements(By.ID, "rptRelatorio_ctl05_ctl04_ctl00_ButtonImg")
+                if btns:
+                    entrou_iframe = True
+                    log.info("  Botão exportar encontrado no iframe.")
+                    break
+                driver.switch_to.default_content()
+            except Exception:
+                driver.switch_to.default_content()
+
+        if not entrou_iframe:
+            driver.switch_to.default_content()
+
+        try:
+            btn_exportar = wait.until(EC.element_to_be_clickable(
+                (By.ID, "rptRelatorio_ctl05_ctl04_ctl00_ButtonImg")
+            ))
+            btn_exportar.click()
+            log.info("  Clicou no botão exportar.")
+            time.sleep(2)
+
+            btn_excel = wait.until(EC.element_to_be_clickable(
+                (By.XPATH, "//a[@title='Excel']")
+            ))
+            btn_excel.click()
+            log.info("  Clicou em Excel.")
+        except Exception as e:
+            log.warning(f"  Botão não encontrado, tentando JS: {e}")
+            try:
+                driver.execute_script("$find('rptRelatorio').exportReport('EXCELOPENXML');")
+                log.info("  Exportação via JS.")
+            except Exception as e2:
+                log.error(f"  Falha total ao exportar: {e2}")
+                driver.save_screenshot(str(BASE_DIR / "newsat_erro_export.png"))
+                driver.switch_to.default_content()
+                return None
+
+        log.info("  Aguardando download...")
+        try:
+            driver.switch_to.default_content()
+            driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": str(pasta_dest)
+            })
+        except Exception:
+            pass
+
+        log.info("  Aguardando arquivo na pasta...")
+        baixando = False
+        for i in range(300):
+            time.sleep(2)
+            crdownload = list(pasta_dest.glob("*.crdownload"))
+            if crdownload and not baixando:
+                baixando = True
+                log.info("  Download em andamento...")
+
+            if arquivo_esperado.exists():
+                log.info(f"  DiaryLoadAutoTank baixado: {arquivo_esperado}")
+                return str(arquivo_esperado)
+
+            xlsx = [
+                f for f in pasta_dest.glob("*.xlsx")
+                if not f.name.startswith(".")
+                and "Atualiza" not in f.name
+                and not str(f).endswith(".crdownload")
+            ]
+            if xlsx:
+                destino = pasta_dest / "DiaryLoadAutoTank.xlsx"
+                try:
+                    if str(xlsx[0]) != str(destino):
+                        shutil.move(str(xlsx[0]), str(destino))
+                        log.info("  Arquivo renomeado para DiaryLoadAutoTank.xlsx")
+                    log.info(f"  DiaryLoadAutoTank baixado: {destino}")
+                    return str(destino)
+                except Exception as e:
+                    log.warning(f"  Erro ao renomear: {e}")
+
+            if i % 10 == 0 and i > 0:
+                log.info(f"  Aguardando download... ({i*2}s)")
+
+        log.warning("  Timeout aguardando download.")
+        try:
+            driver.save_screenshot(str(BASE_DIR / "newsat_timeout.png"))
+        except Exception:
+            pass
+        return None
+
+    except Exception as e:
+        log.error(f"Erro no New SAT: {e}")
+        try:
+            if _driver_global:
+                _driver_global.save_screenshot(str(BASE_DIR / "newsat_erro.png"))
+        except Exception:
+            pass
+        _driver_global = None
+        return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. EXCEL — preencher campos amarelos e rodar macro
+# ══════════════════════════════════════════════════════════════════════════════
+def _aceitar_popup_sap():
+    try:
+        import win32gui
+        import win32con
+        def callback(hwnd, extra):
+            titulo = win32gui.GetWindowText(hwnd)
+            if any(x in titulo for x in ["SAP", "Script", "Allow", "Permitir", "Macro"]):
+                win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+                win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+        win32gui.EnumWindows(callback, None)
+    except Exception as e:
+        log.warning(f"  Não foi possível tratar popup SAP: {e}")
+
+
+def _fechar_popup_sap_gui():
+    try:
+        SapGuiAuto = win32com.client.GetObject("SAPGUI")
+        app = SapGuiAuto.GetScriptingEngine
+        conn = app.Children(0)
+        session = conn.Children(0)
+        try:
+            wnd1 = session.findById("wnd[1]")
+            if wnd1:
+                session.findById("wnd[1]").sendVKey(0)
+                time.sleep(0.5)
+        except Exception:
+            pass
+        session.findById("wnd[0]/tbar[0]/okcd").Text = "/n"
+        session.findById("wnd[0]").sendVKey(0)
+        time.sleep(1)
+    except Exception:
+        pass
+
+
+def _verificar_sap_conectado() -> bool:
+    """
+    Verifica se o SAP GUI está aberto e com sessão ativa.
+    Retorna True se conectado, False se desconectado ou sem sessão.
+    """
+    try:
+        SapGuiAuto = win32com.client.GetObject("SAPGUI")
+        app = SapGuiAuto.GetScriptingEngine
+        if app.Children.Count == 0:
+            log.warning("  SAP: nenhuma conexão ativa.")
+            return False
+        conn = app.Children(0)
+        if conn.Children.Count == 0:
+            log.warning("  SAP: conexão sem sessões ativas.")
+            return False
+        session = conn.Children(0)
+        _ = session.findById("wnd[0]")  # testa se a janela existe
+        return True
+    except Exception as e:
+        log.warning(f"  SAP não está conectado: {e}")
+        return False
+
+
+def _preparar_sap_para_macro() -> bool:
+    """
+    Coloca o SAP dentro da transação ZO3C2 antes de acionar a macro.
+    Simula o estado que existe quando o usuário roda manualmente.
+    Retorna True se preparado com sucesso, False se SAP indisponível.
+    """
+    if not _verificar_sap_conectado():
+        log.error("  SAP desconectado — macro não pode ser executada sem SAP ativo.")
+        return False
+    try:
+        SapGuiAuto = win32com.client.GetObject("SAPGUI")
+        app = SapGuiAuto.GetScriptingEngine
+        conn = app.Children(0)
+        session = conn.Children(0)
+        session.findById("wnd[0]/tbar[0]/okcd").Text = "/nzo3c2"
+        session.findById("wnd[0]").sendVKey(0)
+        time.sleep(2)
+        log.info("  SAP preparado na ZO3C2 para execução da macro.")
+        return True
+    except Exception as e:
+        log.warning(f"  Não foi possível preparar SAP para macro: {e}")
+        return False
+
+
+def _abrir_planilha_correta(excel) -> object:
+    """
+    Fecha e reabre a planilha correta antes de cada ciclo.
+    Garante estado limpo — evita dados pela metade de ciclos anteriores.
+    Se a planilha tiver alterações não salvas feitas pelo usuário, salva antes de fechar.
+    """
+    caminho = CFG["planilha"]["caminho"]
+
+    # Fecha a planilha se já estiver aberta — garante estado limpo
+    for i in range(1, excel.Workbooks.Count + 1):
+        try:
+            wb = excel.Workbooks(i)
+            if wb.Name.lower() == NOME_PLANILHA.lower():
+                if wb.Saved:
+                    # Já salva — fecha sem perder nada
+                    log.info(f"  Fechando planilha '{NOME_PLANILHA}' para reabrir limpa...")
+                    wb.Close(SaveChanges=False)
+                else:
+                    # Tem alterações não salvas — salva antes de fechar
+                    log.info(f"  Planilha tem alterações não salvas. Salvando antes de fechar...")
+                    wb.Save()
+                    wb.Close(SaveChanges=False)
+                break
+        except Exception:
+            break
+
+    # Reabre do disco sempre — estado 100% limpo
+    log.info(f"  Abrindo planilha: {caminho}")
+    return excel.Workbooks.Open(caminho)
+
+
+def rodar_macro_somente() -> bool:
+    """Roda a macro sem alterar nenhum campo — usa os dados já existentes na planilha."""
+    global _macro_rodando
+    macro = CFG["planilha"]["macro"]
+    log.info(f"Rodando macro com dados atuais: {macro}")
+
+    _macro_rodando = True
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = True
+        excel.DisplayAlerts = False
+
+        wb = _abrir_planilha_correta(excel)
+
+        _fechar_popup_sap_gui()
+        _aceitar_popup_sap()
+
+        # Verifica SAP antes de tentar — aborta limpo se desconectado
+        if not _preparar_sap_para_macro():
+            log.error("  SAP indisponível. Macro abortada — será tentada no próximo ciclo.")
+            return False
+
+        for tentativa in range(2):
+            try:
+                excel.Application.Run(f"'{NOME_PLANILHA}'!{macro}")
+                wb.Save()
+                log.info("  Macro executada com sucesso.")
+                return True
+            except Exception as e:
+                if tentativa == 0:
+                    log.warning(f"  Macro falhou (tentativa 1/2), aguardando 10s... ({e})")
+                    _fechar_popup_sap_gui()
+                    if not _preparar_sap_para_macro():
+                        log.error("  SAP desconectou durante retry. Abortando.")
+                        return False
+                    time.sleep(10)
+                else:
+                    log.error(f"  Macro falhou (tentativa 2/2), abortando ciclo: ({e})")
+                    return False
+    except Exception as e:
+        log.error(f"Erro ao rodar macro: {e}")
+        return False
+    finally:
+        _macro_rodando = False
+
+
+def atualizar_planilha_e_rodar_macro(dados_pdf: dict) -> bool:
+    global _macro_rodando
+    if not dados_pdf:
+        log.warning("Nenhum dado de PDF para preencher na planilha.")
+        return False
+
+    macro = CFG["planilha"]["macro"]
+    celulas = CFG["planilha"]["celulas"]
+    log.info(f"Abrindo planilha: {NOME_PLANILHA}")
+
+    _macro_rodando = True
+    try:
+        excel = win32com.client.Dispatch("Excel.Application")
+        excel.Visible = True
+        excel.DisplayAlerts = False
+
+        wb = _abrir_planilha_correta(excel)
+        ws = wb.Sheets("INICIO")
+
+        for produto, vals in dados_pdf.items():
+            if produto not in celulas:
+                continue
+            cel_temp = celulas[produto]["temp"]
+            cel_dens = celulas[produto]["dens"]
+            ws.Range(cel_temp).Value = vals["temp"]
+            ws.Range(cel_dens).Value = vals["dens"]
+            log.info(f"  Preenchido {produto}: Temp={vals['temp']} Dens={vals['dens']}")
+
+        wb.Save()
+        _aceitar_popup_sap()
+
+        # Verifica SAP antes de tentar — aborta limpo se desconectado
+        if not _preparar_sap_para_macro():
+            log.error("  SAP indisponível. Macro abortada — será tentada no próximo ciclo.")
+            return False
+
+        log.info(f"  Executando macro: {macro}")
+        excel.Application.Run(f"'{NOME_PLANILHA}'!{macro}")
+        wb.Save()
+        log.info("  Macro executada com sucesso.")
+        return True
+
+    except Exception as e:
+        log.error(f"Erro ao manipular planilha: {e}")
+        return False
+    finally:
+        _macro_rodando = False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5. RESET DIÁRIO — limpa log e PDFs às 00:00
+# ══════════════════════════════════════════════════════════════════════════════
+def reset_diario():
+    log.info("═══ RESET DIÁRIO ═══ Iniciando novo ciclo de 24h")
+    pasta_pdfs = Path(CFG["email"]["pasta_download"])
+    pasta_arquivo = pasta_pdfs / "Arquivo" / date.today().strftime("%Y%m%d")
+    pasta_arquivo.mkdir(parents=True, exist_ok=True)
+    for pdf in pasta_pdfs.glob("*.pdf"):
+        shutil.move(str(pdf), str(pasta_arquivo / pdf.name))
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+    configurar_logger()
+    log.info("Log reiniciado para o novo dia.")
+
+
+# ── Flag: indica se o último download do Diary falhou ────────────────────────
+_diary_falhou = False
+
+# 6. CICLO PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
+def ciclo_hora():
+    global _diary_falhou
+    log.info("━━━ INÍCIO DO CICLO HORÁRIO ━━━")
+    inicio = datetime.now()
+
+    resultado = baixar_diary_newsat()
+
+    # Marca se o download falhou para retry imediato ao voltar da suspensão
+    if resultado is None:
+        _diary_falhou = True
+        log.warning("  Download do Diary falhou — será retentado ao voltar da suspensão ou no próximo ciclo.")
+    else:
+        _diary_falhou = False
+
+    log.info("Rodando macro com dados atuais da planilha.")
+    sucesso = rodar_macro_somente()
+
+    status = "OK" if sucesso else "ERRO"
+    duracao = (datetime.now() - inicio).seconds
+    log.info(f"━━━ FIM DO CICLO | Status: {status} | Duração: {duracao}s ━━━\n")
+
+    # Atualiza status na interface se estiver aberta
+    if _ui_app:
+        _ui_app.atualizar_status(status, duracao)
+
+    # Alerta Telegram em caso de erro
+    if not sucesso:
+        _enviar_telegram(f"⚠️ RAÍZEN BPA — Erro no ciclo\nHorário: {datetime.now().strftime('%H:%M')}\nVerifique o SAP e o log.")
+
+
+# 7. MANTER SESSÕES VIVAS (a cada 5 minutos)
+# ══════════════════════════════════════════════════════════════════════════════
+TELAS_SEGURAS_SAP = ["", "menu sap", "sap easy access", "sap menu"]
+
+def manter_sessoes_vivas():
+    global _driver_global
+    log.info("── Keep-alive: mantendo sessões ativas ──")
+
+    # ── New SAT ───────────────────────────────────────────────────────────────
+    try:
+        if _driver_global is not None:
+            try:
+                _ = _driver_global.title
+            except Exception:
+                log.warning("  New SAT: Chrome morreu (suspensão?). Recriando...")
+                _driver_global = None
+
+        if _driver_global is not None:
+            _driver_global.get(URL_RELATORIO)
+            time.sleep(2)
+            if not _ja_logado(_driver_global):
+                log.warning("  New SAT: sessão expirou. Recriando Chrome...")
+                _driver_global = None
+            else:
+                log.info("  New SAT: sessão mantida.")
+
+        if _driver_global is None:
+            log.info("  New SAT: recriando Chrome com perfil fixo...")
+            pasta_dest = Path(CFG["newsat"]["pasta_download"])
+            driver = _criar_driver_com_retry(pasta_dest)
+            if driver is not None:
+                _driver_global = driver
+                _driver_global.get(URL_RELATORIO)
+                time.sleep(3)
+                if not _ja_logado(_driver_global):
+                    sucesso = _aguardar_login_manual(_driver_global)
+                    if not sucesso:
+                        _driver_global = None
+                        log.error("  New SAT: não foi possível reconectar.")
+                    else:
+                        log.info("  New SAT: Chrome recriado e logado com sucesso.")
+                else:
+                    log.info("  New SAT: Chrome recriado, sessão válida (perfil fixo).")
+            else:
+                log.error("  New SAT: falha ao criar Chrome no keep-alive.")
+
+    except Exception as e:
+        log.warning(f"  New SAT keep-alive falhou: {e}")
+        _driver_global = None
+
+    # ── SAP — pula se a macro estiver rodando ─────────────────────────────────
+    if _macro_rodando:
+        log.info("  SAP keep-alive pulado — macro em execução.")
+        return
+
+    try:
+        SapGuiAuto = win32com.client.GetObject("SAPGUI")
+        app = SapGuiAuto.GetScriptingEngine
+        conn = app.Children(0)
+        session = conn.Children(0)
+
+        tela_atual = ""
+        try:
+            tela_atual = session.findById("wnd[0]/titl").Text.strip()
+        except Exception:
+            pass
+
+        tela_lower = tela_atual.lower()
+
+        if any(segura in tela_lower for segura in TELAS_SEGURAS_SAP):
+            session.findById("wnd[0]/tbar[0]/okcd").Text = "/nZV04"
+            session.findById("wnd[0]").sendVKey(0)
+            time.sleep(2)
+            session.findById("wnd[0]/tbar[0]/okcd").Text = "/n"
+            session.findById("wnd[0]").sendVKey(0)
+            log.info("  SAP: ZV04 executado, sessão mantida.")
+        else:
+            log.info(f"  SAP keep-alive pulado — usuário na tela: '{tela_atual}'")
+
+    except Exception as e:
+        log.warning(f"  SAP keep-alive falhou: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8. AGENDAMENTO
+# ══════════════════════════════════════════════════════════════════════════════
+def _registrar_jobs():
+    schedule.clear()
+    intervalo = CFG["automacao"]["intervalo_minutos"]
+    schedule.every(intervalo).minutes.do(ciclo_hora)
+    schedule.every(5).minutes.do(manter_sessoes_vivas)
+    schedule.every().day.at("00:00").do(reset_diario)
+
+
+def _limpar_jobs_atrasados():
+    """
+    Cancela execuções atrasadas acumuladas no schedule.
+    Evita que ciclos que deveriam ter rodado enquanto o anterior
+    estava em execução disparem todos de uma vez ao terminar.
+    """
+    agora = datetime.now()
+    for job in schedule.jobs:
+        if job.next_run and job.next_run < agora:
+            job.next_run = agora
+
+
+# ── Referência global da UI ───────────────────────────────────────────────────
+_ui_app = None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERFACE GRÁFICA — Tkinter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LogHandler(logging.Handler):
+    """Redireciona logs para a caixa de texto da interface."""
+    def __init__(self, text_widget):
+        super().__init__()
+        self.text_widget = text_widget
+
+    def emit(self, record):
+        msg = self.format(record)
+        nivel = record.levelname
+
+        def _inserir():
+            self.text_widget.config(state="normal")
+            tag = "info"
+            if nivel == "WARNING":
+                tag = "warning"
+            elif nivel == "ERROR":
+                tag = "error"
+            self.text_widget.insert(tk.END, msg + "\n", tag)
+            self.text_widget.see(tk.END)
+            self.text_widget.config(state="disabled")
+
+        try:
+            self.text_widget.after(0, _inserir)
+        except Exception:
+            pass
+
+
+class AutoBPAApp:
+    def __init__(self, root):
+        global _ui_app
+        _ui_app = self
+        self.root = root
+        self.root.title("AutoBPA Monitor — RAÍZEN Paulínia")
+        self.root.geometry("900x600")
+        self.root.configure(bg="#1a1a2e")
+        self.root.resizable(True, True)
+
+        self._rodando = False
+        self._thread = None
+        self._ultimo_status = "—"
+        self._ciclos_ok = 0
+        self._ciclos_erro = 0
+        self._proximo_ciclo = None
+
+        self._construir_ui()
+        self._atualizar_relogio()
+
+    def _construir_ui(self):
+        # ── Cabeçalho ────────────────────────────────────────────────────────
+        frame_topo = tk.Frame(self.root, bg="#16213e", pady=10)
+        frame_topo.pack(fill="x")
+
+        tk.Label(
+            frame_topo, text="🌡  AutoBPA Monitor",
+            font=("Arial", 18, "bold"), fg="#00d4ff", bg="#16213e"
+        ).pack(side="left", padx=20)
+
+        self.lbl_relogio = tk.Label(
+            frame_topo, text="", font=("Arial", 12), fg="#aaaaaa", bg="#16213e"
+        )
+        self.lbl_relogio.pack(side="right", padx=20)
+
+        # ── Status + Botões ───────────────────────────────────────────────────
+        frame_controle = tk.Frame(self.root, bg="#1a1a2e", pady=10)
+        frame_controle.pack(fill="x", padx=20)
+
+        self.lbl_status = tk.Label(
+            frame_controle, text="⚫  Aguardando início",
+            font=("Arial", 13, "bold"), fg="#aaaaaa", bg="#1a1a2e"
+        )
+        self.lbl_status.pack(side="left")
+
+        self.btn_parar = tk.Button(
+            frame_controle, text="⏹  Parar", command=self._parar,
+            font=("Arial", 11, "bold"), bg="#c0392b", fg="white",
+            relief="flat", padx=15, pady=5, cursor="hand2", state="disabled"
+        )
+        self.btn_parar.pack(side="right", padx=5)
+
+        self.btn_iniciar = tk.Button(
+            frame_controle, text="▶  Iniciar", command=self._iniciar,
+            font=("Arial", 11, "bold"), bg="#27ae60", fg="white",
+            relief="flat", padx=15, pady=5, cursor="hand2"
+        )
+        self.btn_iniciar.pack(side="right", padx=5)
+
+        # ── Métricas ──────────────────────────────────────────────────────────
+        frame_metricas = tk.Frame(self.root, bg="#16213e", pady=8)
+        frame_metricas.pack(fill="x", padx=20, pady=(0, 5))
+
+        self.lbl_ok = tk.Label(
+            frame_metricas, text="✅  Ciclos OK: 0",
+            font=("Arial", 10), fg="#2ecc71", bg="#16213e", padx=15
+        )
+        self.lbl_ok.pack(side="left")
+
+        self.lbl_erro = tk.Label(
+            frame_metricas, text="❌  Erros: 0",
+            font=("Arial", 10), fg="#e74c3c", bg="#16213e", padx=15
+        )
+        self.lbl_erro.pack(side="left")
+
+        self.lbl_proximo = tk.Label(
+            frame_metricas, text="⏱  Próximo ciclo: —",
+            font=("Arial", 10), fg="#f39c12", bg="#16213e", padx=15
+        )
+        self.lbl_proximo.pack(side="left")
+
+        self.lbl_ultimo = tk.Label(
+            frame_metricas, text="🕐  Último ciclo: —",
+            font=("Arial", 10), fg="#aaaaaa", bg="#16213e", padx=15
+        )
+        self.lbl_ultimo.pack(side="left")
+
+        # ── Caixa de log ──────────────────────────────────────────────────────
+        frame_log = tk.Frame(self.root, bg="#1a1a2e")
+        frame_log.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        tk.Label(
+            frame_log, text="📋  Log em tempo real",
+            font=("Arial", 10, "bold"), fg="#00d4ff", bg="#1a1a2e"
+        ).pack(anchor="w", pady=(0, 3))
+
+        self.log_box = scrolledtext.ScrolledText(
+            frame_log, height=20, font=("Courier New", 9),
+            bg="#0d0d0d", fg="#00ff41", insertbackground="white",
+            state="disabled", relief="flat", padx=8, pady=8
+        )
+        self.log_box.pack(fill="both", expand=True)
+
+        # Tags de cor para níveis de log
+        self.log_box.tag_config("info",    foreground="#00ff41")
+        self.log_box.tag_config("warning", foreground="#f39c12")
+        self.log_box.tag_config("error",   foreground="#e74c3c")
+
+        # Conecta handler de log à caixa de texto
+        handler = LogHandler(self.log_box)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logging.getLogger().addHandler(handler)
+
+        # ── Rodapé ────────────────────────────────────────────────────────────
+        tk.Label(
+            self.root, text="RAÍZEN — Terminal Paulínia  |  Automação de Temperatura",
+            font=("Arial", 8), fg="#555555", bg="#1a1a2e"
+        ).pack(pady=(0, 5))
+
+    def _atualizar_relogio(self):
+        self.lbl_relogio.config(text=datetime.now().strftime("%d/%m/%Y  %H:%M:%S"))
+        if self._rodando and self._proximo_ciclo:
+            restante = max(0, int((self._proximo_ciclo - datetime.now()).total_seconds()))
+            mins = restante // 60
+            segs = restante % 60
+            self.lbl_proximo.config(text=f"⏱  Próximo ciclo: {mins:02d}:{segs:02d}")
+        self.root.after(1000, self._atualizar_relogio)
+
+    def atualizar_status(self, status: str, duracao: int):
+        """Chamado pelo ciclo_hora após cada execução."""
+        self._ultimo_status = status
+        hora = datetime.now().strftime("%H:%M")
+
+        if status == "OK":
+            self._ciclos_ok += 1
+            self.lbl_status.config(
+                text=f"🟢  Rodando — Último ciclo OK às {hora} ({duracao}s)",
+                fg="#2ecc71"
+            )
+        else:
+            self._ciclos_erro += 1
+            self.lbl_status.config(
+                text=f"🔴  Erro no último ciclo às {hora}",
+                fg="#e74c3c"
+            )
+
+        self.lbl_ok.config(text=f"✅  Ciclos OK: {self._ciclos_ok}")
+        self.lbl_erro.config(text=f"❌  Erros: {self._ciclos_erro}")
+        self.lbl_ultimo.config(text=f"🕐  Último ciclo: {hora}")
+
+        # Calcula próximo ciclo
+        intervalo = CFG["automacao"]["intervalo_minutos"]
+        self._proximo_ciclo = datetime.now().replace(second=0, microsecond=0)
+        self._proximo_ciclo = self._proximo_ciclo.replace(
+            minute=(self._proximo_ciclo.minute // intervalo + 1) * intervalo % 60
+        )
+        if self._proximo_ciclo <= datetime.now():
+            import datetime as dt_module
+            self._proximo_ciclo += dt_module.timedelta(minutes=intervalo)
+
+    def _loop_automacao(self):
+        """Loop principal da automação rodando em thread separada."""
+        log.info("╔══════════════════════════════════════════╗")
+        log.info("║  AUTOMAÇÃO TEMPERATURA BPA - INICIANDO   ║")
+        log.info("╚══════════════════════════════════════════╝")
+
+        _impedir_suspensao()
+        _registrar_jobs()
+
+        try:
+            ciclo_hora()
+        except Exception as e:
+            log.error(f"Erro no ciclo inicial: {e}")
+
+        _limpar_jobs_atrasados()
+
+        ultimo_tick = datetime.now()
+        ultimo_ciclo = datetime.now()
+
+        while self._rodando:
+            try:
+                agora = datetime.now()
+                delta = (agora - ultimo_tick).total_seconds()
+
+                if delta > 120:
+                    desde_ultimo_ciclo = (agora - ultimo_ciclo).total_seconds()
+                    intervalo_segundos = CFG["automacao"]["intervalo_minutos"] * 60
+
+                    if _diary_falhou:
+                        log.warning(f"  Sistema voltou da suspensão ({int(delta)}s). Retentando imediatamente.")
+                        try:
+                            ciclo_hora()
+                            ultimo_ciclo = datetime.now()
+                        except Exception as e:
+                            log.error(f"  Erro no ciclo pós-suspensão: {e}")
+                    elif desde_ultimo_ciclo < intervalo_segundos:
+                        log.warning(f"  Sistema voltou da suspensão ({int(delta)}s). Último ciclo há {int(desde_ultimo_ciclo)}s — aguardando.")
+                    else:
+                        log.warning(f"  Sistema voltou da suspensão ({int(delta)}s). Rodando ciclo.")
+                        try:
+                            ciclo_hora()
+                            ultimo_ciclo = datetime.now()
+                        except Exception as e:
+                            log.error(f"  Erro no ciclo pós-suspensão: {e}")
+
+                    _registrar_jobs()
+                    _limpar_jobs_atrasados()
+
+                ultimo_tick = agora
+
+                jobs_antes = [j for j in schedule.jobs if j.should_run and j.job_func.func == ciclo_hora]
+                schedule.run_pending()
+                _limpar_jobs_atrasados()
+
+                if jobs_antes:
+                    ultimo_ciclo = datetime.now()
+
+                # ── Watchdog: alerta se ficar mais de 70 min sem ciclo ───────
+                minutos_sem_ciclo = (datetime.now() - ultimo_ciclo).total_seconds() / 60
+                if minutos_sem_ciclo > 70:
+                    log.warning(f"  Watchdog: {int(minutos_sem_ciclo)} min sem ciclo completo!")
+                    _enviar_telegram(
+                        f"\u26a0\ufe0f RAÍZEN BPA \u2014 Sistema parado!\n"
+                        f"Último ciclo há {int(minutos_sem_ciclo)} minutos.\n"
+                        f"Verifique o computador do turno."
+                    )
+                    ultimo_ciclo = datetime.now()
+
+            except Exception as e:
+                log.error(f"  Erro no loop: {e}. Continuando...")
+
+            time.sleep(30)
+
+        log.info("Automação pausada.")
+
+    def _iniciar(self):
+        if not self._rodando:
+            self._rodando = True
+            self.btn_iniciar.config(state="disabled")
+            self.btn_parar.config(state="normal")
+            self.lbl_status.config(text="🟡  Iniciando...", fg="#f39c12")
+            _enviar_telegram("✅ AutoBPA Monitor iniciado\nTerminal Paulínia")
+
+            self._thread = threading.Thread(target=self._loop_automacao, daemon=True)
+            self._thread.start()
+
+    def _parar(self):
+        if self._rodando:
+            self._rodando = False
+            self.btn_iniciar.config(state="normal")
+            self.btn_parar.config(state="disabled")
+            self.lbl_status.config(text="⚫  Parado", fg="#aaaaaa")
+            _enviar_telegram("⏹ AutoBPA Monitor pausado\nTerminal Paulínia")
+            _liberar_suspensao()
+
+
+if __name__ == "__main__":
+    _garantir_instancia_unica()
+
+    root = tk.Tk()
+    app = AutoBPAApp(root)
+    root.mainloop()
