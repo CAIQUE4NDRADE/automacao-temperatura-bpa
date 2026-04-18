@@ -1,12 +1,12 @@
-# 🌡️ Automação de Atualização de Temperatura — Raízen BPA
+# 🌡️ AutoBPA Monitor — Automação de Temperatura · Raízen BPA
 
-> Automação desenvolvida para eliminar o processo manual de atualização de temperatura no SAP, integrando New SAT, Outlook e Excel em um ciclo totalmente automático.
+Automação desenvolvida para eliminar o processo manual de atualização de temperatura no SAP, integrando New SAT, Excel e SAP GUI em um ciclo totalmente automático, com interface gráfica e alertas via Telegram.
 
 ---
 
 ## 📌 Sobre o Projeto
 
-No terminal de combustíveis da Raízen — Base de Paulínia (BPA), a atualização de temperatura no SAP era realizada manualmente pelos operadores de gate a cada ciclo, consumindo em média **10 minutos por atualização** e exigindo atenção constante durante o turno.
+No terminal de combustíveis da Raízen — Base de Paulínia (BPA), a atualização de temperatura no SAP era realizada manualmente pelos operadores de gate a cada ciclo, consumindo em média 10 minutos por atualização e exigindo atenção constante durante o turno.
 
 Este projeto automatiza 100% desse processo, permitindo que os operadores foquem em atividades de maior valor operacional.
 
@@ -16,33 +16,78 @@ Este projeto automatiza 100% desse processo, permitindo que os operadores foquem
 
 | Frequência | Ação |
 |---|---|
-| A cada **30 minutos** | Baixa o `DiaryLoadAutoTank.xlsx` do New SAT |
-| A cada **30 minutos** | Preenche a planilha e roda a macro de atualização no SAP |
-| A cada **5 minutos** | Keep-alive: executa `ZV04` no SAP e acessa o New SAT para evitar timeout por inatividade |
-| À **meia-noite** | Reseta o log diário automaticamente |
+| A cada 30 minutos | Baixa o `DiaryLoadAutoTank.xlsx` do New SAT |
+| A cada 30 minutos | Fecha e reabre a planilha limpa, prepara o SAP na ZO3C2 e roda a macro `Extrai_Atualiza` |
+| A cada 5 minutos | Keep-alive: executa ZV04 no SAP e acessa o New SAT para evitar timeout por inatividade |
+| Ao voltar da suspensão | Detecta automaticamente e roda ciclo imediato se necessário |
+| À meia-noite | Reseta o log diário automaticamente |
+
+---
+
+## 🖥️ Interface Gráfica
+
+O sistema possui interface visual desenvolvida em Tkinter:
+
+- **Botões Iniciar / Parar** — controle total da automação
+- **Status em tempo real** — 🟢 Rodando / 🔴 Erro / ⚫ Parado
+- **Contagem regressiva** para o próximo ciclo
+- **Contadores** de ciclos OK e erros
+- **Log colorido** em tempo real na tela (verde = normal, laranja = aviso, vermelho = erro)
+
+---
+
+## 📲 Alertas via Telegram
+
+O sistema envia notificações automáticas para o celular do operador:
+
+| Evento | Mensagem |
+|---|---|
+| Programa iniciado | ✅ AutoBPA Monitor iniciado |
+| Programa parado | ⏹ AutoBPA Monitor pausado |
+| Erro no ciclo | ⚠️ Erro no ciclo — verificar SAP e log |
+| 70 min sem ciclo | ⚠️ Sistema parado! Último ciclo há X minutos |
+
+---
+
+## 🛡️ Proteções e Resiliências
+
+- **Chrome com perfil fixo** — login salvo, sem necessidade de autenticar a cada ciclo
+- **Kill de Chrome órfão** — mata processos travados antes de recriar sessão
+- **Reconexão automática** do Chrome ao detectar queda
+- **Flag `_macro_rodando`** — impede que o keep-alive SAP interrompa a execução da macro
+- **Verificação de tela SAP** — keep-alive pula se o operador estiver em qualquer transação
+- **Detecção de suspensão** — ao voltar, decide se roda ciclo imediato ou aguarda
+- **Retry imediato** se o download do Diary falhou antes da suspensão
+- **Planilha fixada por nome** — evita conflito com outras planilhas abertas
+- **Loop principal blindado** — nunca fecha, qualquer erro é logado e o programa continua
+- **Instância única** — impede abertura dupla acidental
+- **Watchdog** — alerta Telegram se ficar mais de 70 minutos sem ciclo completo
+- **Impedimento de suspensão** via `powercfg` ao iniciar
 
 ---
 
 ## 🛠️ Tecnologias Utilizadas
 
 - **Python 3.11+** — orquestração do fluxo completo
+- **Tkinter** — interface gráfica nativa
 - **Selenium + ChromeDriver** — automação do New SAT (login SSO Microsoft, navegação, download)
 - **pywin32 (win32com)** — integração com Excel e SAP GUI Scripting
-- **pdfplumber** — extração de dados de PDFs de Controle de Qualidade
 - **schedule** — agendamento dos ciclos
-- **openpyxl** — manipulação da planilha Excel
+- **requests** — envio de alertas via Telegram Bot API
+- **webdriver-manager** — gerenciamento automático do ChromeDriver
 
 ---
 
 ## 🗂️ Estrutura do Projeto
 
 ```
-automacao_temperatura/
-├── monitor_temperatura.py   # Script principal
-├── config.json              # Configurações (caminhos, macro, intervalos)
-├── instalar.bat             # Instalador de dependências
-├── iniciar.bat              # Inicializa a automação
-└── Logs/                    # Logs diários gerados automaticamente
+Atualização de Temperatura/
+├── monitor_temperatura.py          # Script principal (automação + interface)
+├── config.json                     # Configurações (caminhos, macro, intervalos)
+├── iniciar.bat                     # Inicializa a automação
+├── Atualiza Temperatura BPA rev2.xlsm  # Planilha com macro SAP
+├── chrome_profile/                 # Perfil fixo do Chrome (login salvo)
+└── Logs/                           # Logs diários gerados automaticamente
 ```
 
 ---
@@ -50,23 +95,16 @@ automacao_temperatura/
 ## 🚀 Como Instalar
 
 ### Pré-requisitos
+
 - Python 3.11+
 - Google Chrome instalado
 - Microsoft Excel com a planilha `.xlsm` configurada
-- SAP GUI com scripting habilitado
-- Microsoft Outlook aberto e logado
+- SAP GUI com scripting habilitado e logado
 
-### Instalação
+### Instalação das dependências
 
 ```bash
-# 1. Clone o repositório
-git clone https://github.com/CAIQUE4NDRADE/automacao-temperatura-bpa.git
-
-# 2. Entre na pasta
-cd automacao-temperatura-bpa
-
-# 3. Instale as dependências
-python -m pip install pdfplumber selenium schedule pywin32 openpyxl webdriver-manager
+pip install selenium webdriver-manager schedule pywin32 pdfplumber requests pyautogui pyperclip
 ```
 
 ### Configuração
@@ -80,10 +118,11 @@ O arquivo `config.json` usa `{usuario}` como variável dinâmica — o sistema d
         "macro": "Extrai_Atualiza"
     },
     "newsat": {
-        "url": "https://bpa.newsat.cosan.rede/Home"
+        "pasta_download": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura"
     },
     "automacao": {
-        "intervalo_minutos": 30
+        "intervalo_minutos": 30,
+        "pasta_log": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura\\Logs"
     }
 }
 ```
@@ -106,12 +145,13 @@ Ou clique duas vezes em `iniciar.bat`.
 | Intervenção manual no ciclo | Obrigatória | Apenas em viradas/aberturas |
 | Risco de esquecimento | Alto | Eliminado |
 | Disponibilidade do operador | Parcialmente comprometida | Total |
+| Monitoramento remoto | Inexistente | Alertas no celular via Telegram |
 
 ---
 
 ## ⚠️ Intervenções Manuais Necessárias
 
-O sistema **não substitui** a intervenção humana nos seguintes momentos — que requerem julgamento operacional:
+O sistema não substitui a intervenção humana nos seguintes momentos — que requerem julgamento operacional:
 
 - **Virada de tanque** — o operador deve alimentar os dados na planilha
 - **Atualização de densidade** — inserção manual dos laudos de qualidade
@@ -125,8 +165,8 @@ O sistema **não substitui** a intervenção humana nos seguintes momentos — q
 14:00:01 [INFO] ━━━ INÍCIO DO CICLO HORÁRIO ━━━
 14:00:05 [INFO]   Acessando New SAT para baixar DiaryLoadAutoTank...
 14:02:30 [INFO]   DiaryLoadAutoTank baixado com sucesso
-14:02:31 [INFO]   Rodando macro com dados atuais: Extrai_Atualiza
-14:02:35 [INFO]   Planilha já estava aberta, reutilizando.
+14:02:31 [INFO]   Fechando planilha para reabrir limpa...
+14:02:33 [INFO]   SAP preparado na ZO3C2 para execução da macro.
 14:02:55 [INFO]   Macro executada com sucesso.
 14:02:55 [INFO] ━━━ FIM DO CICLO | Status: OK | Duração: 174s ━━━
 
@@ -139,15 +179,15 @@ O sistema **não substitui** a intervenção humana nos seguintes momentos — q
 
 ## 👤 Autor
 
-**Caique Bezerra de Andrade**
-Operações de Terminal — Raízen BPA Paulínia/SP
+**Caique Bezerra de Andrade**  
+Operações de Terminal — Raízen BPA · Paulínia/SP  
 Transição de carreira para Tecnologia | Front End & Análise e Desenvolvimento de Sistemas
 
-[![GitHub](https://img.shields.io/badge/GitHub-CAIQUE4NDRADE-181717?style=flat&logo=github)](https://github.com/CAIQUE4NDRADE)
+[![GitHub](https://img.shields.io/badge/GitHub-CAIQUE4NDRADE-black?logo=github)](https://github.com/CAIQUE4NDRADE)
 
 ---
 
 ## 📄 Licença
 
-Projeto desenvolvido internamente para uso operacional na Raízen BPA.
+Projeto desenvolvido internamente para uso operacional na Raízen BPA.  
 Código disponibilizado para fins de portfólio e aprendizado.
