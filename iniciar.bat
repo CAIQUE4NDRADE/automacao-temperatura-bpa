@@ -1,9 +1,11 @@
 @echo off
-:: Inicia a automação em background (sem janela preta permanente)
-echo Iniciando Automação Temperatura BPA...
-start "AutomacaoTemperatura" /min python "%~dp0monitor_temperatura.py"
+cd /d "%~dp0"
+title Automacao de Temperatura
+set PY=py -3.13
+%PY% --version >nul 2>&1
+if errorlevel 1 set PY=python
+del /q "%~dp0monitor.lock" 2>nul
+%PY% "%~dp0monitor_temperatura.py"
 echo.
-echo [OK] Automacao iniciada em background.
-echo      Verifique os logs em: Logs\temperatura_AAAAMMDD.log
-echo.
-timeout /t 3 >nul
+echo ===== O programa fechou. Se apareceu erro acima, tire um print. =====
+pause

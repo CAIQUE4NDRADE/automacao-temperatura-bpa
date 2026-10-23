@@ -1,0 +1,25 @@
+# Configuração real (tem caminhos e links internos) — suba só o config.example.json
+config.json
+
+# Planilhas, relatórios e PDFs da operação
+*.xlsx
+*.xlsm
+*.xls
+*.pdf
+
+# Sessão / login
+newsat_cookies.json
+chrome_perfil_robo/
+emails_processados*.json
+monitor.lock
+
+# Logs e prints de diagnóstico
+Logs/
+*.log
+*.png
+debug_pdf_*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/

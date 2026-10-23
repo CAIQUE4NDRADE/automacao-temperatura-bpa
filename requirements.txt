@@ -1,0 +1,5 @@
+selenium
+webdriver-manager
+schedule
+pywin32
+pdfplumber

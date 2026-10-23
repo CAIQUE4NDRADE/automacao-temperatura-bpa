@@ -1,0 +1,34 @@
+{
+    "modo_teste": true,
+
+    "planilha": {
+        "caminho": "{pasta}\\Atualiza Temperatura BPA rev2.xlsm",
+        "macro": "Extrai_Atualiza"
+    },
+    "newsat": {
+        "url_relatorio": "https://SEU-SERVIDOR-NEWSAT/Report/DiaryLoadAutoTank",
+        "pasta_download": "{pasta}"
+    },
+    "automacao": {
+        "intervalo_minutos": 30,
+        "pasta_log": "{pasta}\\Logs"
+    },
+    "email": {
+        "url": "https://outlook.cloud.microsoft/mail/",
+        "buscas": ["Virada", "ABERTURA DE TANQUES", "Atualização de densidade"]
+    },
+    "janela": {
+        "inicio": "01:00",
+        "fim": "21:30",
+        "limpar_log_rede": "23:59"
+    },
+    "log_rede": {
+        "ativo": false,
+        "caminho": "https://SEU-TENANT.sharepoint.com/sites/SEU-SITE/Documentos%20Compartilhados/.../LOGs.xlsx",
+        "aba": "Logs",
+        "linha_inicial": 4,
+        "limpar_log_local": false
+    },
+    "chrome_porta_debug": 9223,
+    "tempo_login_min": 10
+}

@@ -1,193 +1,137 @@
-# 🌡️ AutoBPA Monitor — Automação de Temperatura · Raízen BPA
+# 🛢️ Automação de Temperatura e Densidade — Terminal de Combustíveis
 
-Automação desenvolvida para eliminar o processo manual de atualização de temperatura no SAP, integrando New SAT, Excel e SAP GUI em um ciclo totalmente automático, com interface gráfica e alertas via Telegram.
+> **~6 horas por dia de trabalho manual do administrativo eliminadas.**
+> Um robô em Python que lê os e-mails de qualidade dos tanques, preenche a planilha,
+> atualiza o SAP e registra tudo em um log compartilhado — de 01:00 às 21:30, sem ninguém.
+
+![Python](https://img.shields.io/badge/Python-3.13-3776AB?logo=python&logoColor=white)
+![Selenium](https://img.shields.io/badge/Selenium-Chrome-43B02A?logo=selenium&logoColor=white)
+![Excel](https://img.shields.io/badge/Excel-COM%20%2F%20VBA-217346?logo=microsoftexcel&logoColor=white)
+![SAP](https://img.shields.io/badge/SAP%20GUI-Scripting-0FAAFF?logo=sap&logoColor=white)
+![Status](https://img.shields.io/badge/status-em%20produ%C3%A7%C3%A3o-success)
 
 ---
 
-## 📌 Sobre o Projeto
+## 📌 O problema
 
-No terminal de combustíveis da Raízen — Base de Paulínia (BPA), a atualização de temperatura no SAP era realizada manualmente pelos operadores de gate a cada ciclo, consumindo em média 10 minutos por atualização e exigindo atenção constante durante o turno.
+Num terminal de distribuição de combustíveis, a temperatura e a densidade de cada produto
+(gasolina, S10, S500, B100, etanol anidro e hidratado) precisam estar corretas no SAP —
+elas entram no cálculo de volume a 20 °C de cada carregamento.
 
-Este projeto automatiza 100% desse processo, permitindo que os operadores foquem em atividades de maior valor operacional.
+Esses dados chegam ao longo do dia por e-mail, num PDF de **Controle de Qualidade**:
 
----
+- **Abertura de tanques** — logo após a meia-noite, com todos os produtos do dia;
+- **Viradas de tanque** — a qualquer hora, quando um produto passa a sair de outro tanque
+  (ex.: *"Virada de GAS p/ TQ 01 às 05h30"*).
 
-## ⚙️ O que o sistema faz
+O processo era **100% manual** e repetido o dia inteiro pelo administrativo:
 
-| Frequência | Ação |
+1. Monitorar a caixa de e-mail e abrir cada abertura/virada;
+2. Abrir o PDF e localizar densidade e temperatura da amostra do produto;
+3. Digitar os valores na planilha de atualização;
+4. Baixar o relatório de carregamentos do sistema da base;
+5. Rodar a macro que atualiza o SAP — **a cada 30 minutos**;
+6. Copiar o registro da atualização para o log compartilhado da equipe.
+
+Resultado: horas por dia presas numa tarefa repetitiva, com risco de erro de digitação
+num dado que impacta o faturamento.
+
+## ✅ A solução
+
+Um robô (Python + interface Tkinter) que faz o ciclo inteiro sozinho:
+
+```mermaid
+flowchart LR
+    A[📧 Outlook Web<br/>Abertura / Virada] --> B[📄 PDF anexo<br/>Controle de Qualidade]
+    B --> C[🔎 Extração<br/>produto · tanque · densidade · temp.]
+    C --> D[🛡️ Validações<br/>data de hoje · produto/tanque = assunto]
+    D --> E[📊 Planilha Excel<br/>campos de entrada]
+    F[🌐 Sistema da base<br/>relatório de carregamentos] --> G
+    E --> G[⚙️ Macro VBA<br/>SAP GUI Scripting]
+    G --> H[🗂️ Log local]
+    H --> I[☁️ Log compartilhado<br/>SharePoint]
+```
+
+| Antes (manual) | Depois (robô) |
 |---|---|
-| A cada 30 minutos | Baixa o `DiaryLoadAutoTank.xlsx` do New SAT |
-| A cada 30 minutos | Fecha e reabre a planilha limpa, prepara o SAP na ZO3C2 e roda a macro `Extrai_Atualiza` |
-| A cada 5 minutos | Keep-alive: executa ZV04 no SAP e acessa o New SAT para evitar timeout por inatividade |
-| Ao voltar da suspensão | Detecta automaticamente e roda ciclo imediato se necessário |
-| À meia-noite | Reseta o log diário automaticamente |
+| Pessoa monitorando e-mail o dia todo | Leitura automática a cada 30 min |
+| Digitação de densidade/temperatura | Extraído direto do PDF, com conferência |
+| Macro rodada à mão | Até **42 atualizações/dia** (01:00 → 21:30) |
+| Log copiado manualmente | Gravado no SharePoint a cada ciclo; limpo às 23:59 |
+| **~6 h/dia do administrativo** | **~0 h** — só acompanhamento |
 
----
+## 📈 Impacto
 
-## 🖥️ Interface Gráfica
+- ⏱️ **~6 horas/dia** de trabalho manual liberadas — **~30 h/semana** e **~130 h/mês** (22 dias úteis); como a operação roda todos os dias, chega a **~180 h/mês**.
+- 🎯 **Zero digitação** de densidade/temperatura → elimina erro humano num dado que vai para o faturamento.
+- 🌙 Atualização contínua inclusive de **madrugada**, quando a abertura de tanques chega.
+- 🧾 **Rastreabilidade**: cada valor aplicado fica no log com o e-mail de origem e o horário a partir do qual vale.
 
-O sistema possui interface visual desenvolvida em Tkinter:
+> Ganho estimado pela equipe com base na rotina anterior.
 
-- **Botões Iniciar / Parar** — controle total da automação
-- **Status em tempo real** — 🟢 Rodando / 🔴 Erro / ⚫ Parado
-- **Contagem regressiva** para o próximo ciclo
-- **Contadores** de ciclos OK e erros
-- **Log colorido** em tempo real na tela (verde = normal, laranja = aviso, vermelho = erro)
+## 🧠 Desafios técnicos resolvidos
 
----
+**1. PDF com "linha fantasma"**
+O PDF do controle de qualidade tem uma linha oculta desenhada quase na mesma altura da linha real.
+A extração padrão misturava as duas (`GAS` + `EHC` → `GEHACS`, `20/10/2026` → `2200//1100//22002266`).
+Solução: extrair o texto com tolerância vertical mínima (`pdfplumber`, `y_tolerance=0.2`), separando as camadas.
 
-## 📲 Alertas via Telegram
+**2. Garantir que o PDF é do e-mail certo**
+A lista de resultados do Outlook também mostra anexos de e-mails antigos. O robô:
+- só aceita o anexo que está **no painel do e-mail aberto** (posição na tela, à direita do item clicado);
+- confere se o **produto e o tanque do PDF batem com o assunto** (*"Virada de GAS p/ TQ 01"* ⇒ precisa vir GAS no TQ 1);
+- aceita **somente dados do dia atual** (assunto, lista e coluna Data da tabela).
 
-O sistema envia notificações automáticas para o celular do operador:
+**3. Ordem cronológica e viradas futuras**
+Cada e-mail é aplicado uma única vez; o mais recente vence por produto (virada das 05:30 substitui a abertura das 00:59).
+Uma virada *"às 18h"* que chega às 16:47 **espera o horário** para entrar.
 
-| Evento | Mensagem |
-|---|---|
-| Programa iniciado | ✅ AutoBPA Monitor iniciado |
-| Programa parado | ⏹ AutoBPA Monitor pausado |
-| Erro no ciclo | ⚠️ Erro no ciclo — verificar SAP e log |
-| 70 min sem ciclo | ⚠️ Sistema parado! Último ciclo há X minutos |
+**4. Testar sem arriscar produção**
+Como a atualização do SAP afeta o faturamento, foi criado um **modo teste**: lê os e-mails de verdade,
+preenche uma **cópia** da planilha e grava num **log de cópia** — sem rodar a macro, sem tocar o SAP nem a rede.
+O modo produção só foi ligado depois dos valores do teste baterem 100% com os digitados à mão.
 
----
+**5. Robustez de um robô que roda sozinho**
+- Chrome dedicado com perfil próprio (login persistente; o robô não fecha o navegador);
+- se o relatório não baixar, a macro **não roda** (evita um `MsgBox` que travaria o Excel);
+- trava de instância única, bloqueio de suspensão do Windows, *keep-alive* das sessões, notificação de erro na bandeja;
+- janela de funcionamento configurável (01:00–21:30) e limpeza diária do log às 23:59.
 
-## 🛡️ Proteções e Resiliências
+## 🛠️ Tecnologias
 
-- **Chrome com perfil fixo** — login salvo, sem necessidade de autenticar a cada ciclo
-- **Kill de Chrome órfão** — mata processos travados antes de recriar sessão
-- **Reconexão automática** do Chrome ao detectar queda
-- **Flag `_macro_rodando`** — impede que o keep-alive SAP interrompa a execução da macro
-- **Verificação de tela SAP** — keep-alive pula se o operador estiver em qualquer transação
-- **Detecção de suspensão** — ao voltar, decide se roda ciclo imediato ou aguarda
-- **Retry imediato** se o download do Diary falhou antes da suspensão
-- **Planilha fixada por nome** — evita conflito com outras planilhas abertas
-- **Loop principal blindado** — nunca fecha, qualquer erro é logado e o programa continua
-- **Instância única** — impede abertura dupla acidental
-- **Watchdog** — alerta Telegram se ficar mais de 70 minutos sem ciclo completo
-- **Impedimento de suspensão** via `powercfg` ao iniciar
-
----
-
-## 🛠️ Tecnologias Utilizadas
-
-- **Python 3.11+** — orquestração do fluxo completo
-- **Tkinter** — interface gráfica nativa
-- **Selenium + ChromeDriver** — automação do New SAT (login SSO Microsoft, navegação, download)
-- **pywin32 (win32com)** — integração com Excel e SAP GUI Scripting
+- **Python 3.13** — orquestração, regras e interface (Tkinter)
+- **Selenium** — Outlook Web e sistema da base (download do relatório)
+- **pdfplumber** — extração de texto do PDF de qualidade
+- **pywin32 (COM)** — Excel (planilha, macro VBA, log no SharePoint)
+- **SAP GUI Scripting** — via macro VBA existente (transação de ajuste de temperatura)
 - **schedule** — agendamento dos ciclos
-- **requests** — envio de alertas via Telegram Bot API
-- **webdriver-manager** — gerenciamento automático do ChromeDriver
 
----
+## 🚀 Como rodar
 
-## 🗂️ Estrutura do Projeto
+> Requer Windows, Google Chrome, Excel desktop e SAP GUI com scripting habilitado.
 
-```
-Atualização de Temperatura/
-├── monitor_temperatura.py          # Script principal (automação + interface)
-├── config.json                     # Configurações (caminhos, macro, intervalos)
-├── iniciar.bat                     # Inicializa a automação
-├── Atualiza Temperatura BPA rev2.xlsm  # Planilha com macro SAP
-├── chrome_profile/                 # Perfil fixo do Chrome (login salvo)
-└── Logs/                           # Logs diários gerados automaticamente
+```bat
+instalar.bat          :: instala dependências e cria o config.json a partir do exemplo
+:: edite o config.json (caminhos, URL do relatório, log compartilhado)
+iniciar.bat
 ```
 
----
+Comece **sempre** com `"modo_teste": true` no `config.json`. Só desligue depois de conferir
+no log (`[TESTE] Colocaria no AMARELO ...`) que os valores batem com a operação.
 
-## 🚀 Como Instalar
-
-### Pré-requisitos
-
-- Python 3.11+
-- Google Chrome instalado
-- Microsoft Excel com a planilha `.xlsm` configurada
-- SAP GUI com scripting habilitado e logado
-
-### Instalação das dependências
-
-```bash
-pip install selenium webdriver-manager schedule pywin32 pdfplumber requests pyautogui pyperclip
-```
-
-### Configuração
-
-O arquivo `config.json` usa `{usuario}` como variável dinâmica — o sistema detecta automaticamente o usuário Windows logado, sem necessidade de edição manual.
-
-```json
-{
-    "planilha": {
-        "caminho": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura\\Atualiza Temperatura BPA rev2.xlsm",
-        "macro": "Extrai_Atualiza"
-    },
-    "newsat": {
-        "pasta_download": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura"
-    },
-    "automacao": {
-        "intervalo_minutos": 30,
-        "pasta_log": "C:\\Users\\{usuario}\\Downloads\\Atualização de Temperatura\\Logs"
-    }
-}
-```
-
-### Execução
-
-```bash
-python monitor_temperatura.py
-```
-
-Ou clique duas vezes em `iniciar.bat`.
-
----
-
-## 📊 Ganhos Operacionais
-
-| Indicador | Antes | Depois |
-|---|---|---|
-| Tempo por atualização | ~10 minutos | 0 minutos (automático) |
-| Intervenção manual no ciclo | Obrigatória | Apenas em viradas/aberturas |
-| Risco de esquecimento | Alto | Eliminado |
-| Disponibilidade do operador | Parcialmente comprometida | Total |
-| Monitoramento remoto | Inexistente | Alertas no celular via Telegram |
-
----
-
-## ⚠️ Intervenções Manuais Necessárias
-
-O sistema não substitui a intervenção humana nos seguintes momentos — que requerem julgamento operacional:
-
-- **Virada de tanque** — o operador deve alimentar os dados na planilha
-- **Atualização de densidade** — inserção manual dos laudos de qualidade
-- **Início do dia (abertura)** — preenchimento dos dados iniciais do turno
-
----
-
-## 📋 Exemplo de Log
+## 📁 Estrutura
 
 ```
-14:00:01 [INFO] ━━━ INÍCIO DO CICLO HORÁRIO ━━━
-14:00:05 [INFO]   Acessando New SAT para baixar DiaryLoadAutoTank...
-14:02:30 [INFO]   DiaryLoadAutoTank baixado com sucesso
-14:02:31 [INFO]   Fechando planilha para reabrir limpa...
-14:02:33 [INFO]   SAP preparado na ZO3C2 para execução da macro.
-14:02:55 [INFO]   Macro executada com sucesso.
-14:02:55 [INFO] ━━━ FIM DO CICLO | Status: OK | Duração: 174s ━━━
-
-14:05:00 [INFO] ── Keep-alive: mantendo sessões ativas ──
-14:05:02 [INFO]   New SAT: sessão mantida.
-14:05:04 [INFO]   SAP: ZV04 executado, sessão mantida.
+├── monitor_temperatura.py   # robô completo (e-mail → PDF → planilha → SAP → log)
+├── config.example.json      # modelo de configuração (copie para config.json)
+├── requirements.txt
+├── instalar.bat / iniciar.bat
+└── .gitignore               # planilhas, logs, cookies e config real nunca sobem
 ```
-
----
 
 ## 👤 Autor
 
-**Caique Bezerra de Andrade**  
-Operações de Terminal — Raízen BPA · Paulínia/SP  
-Transição de carreira para Tecnologia | Front End & Análise e Desenvolvimento de Sistemas
+**Caique Andrade** — Assistente de Operações e desenvolvedor de automações (Python/RPA) para logística de combustíveis.
+[GitHub](https://github.com/CAIQUE4NDRADE)
 
-[![GitHub](https://img.shields.io/badge/GitHub-CAIQUE4NDRADE-black?logo=github)](https://github.com/CAIQUE4NDRADE)
-
----
-
-## 📄 Licença
-
-Projeto desenvolvido internamente para uso operacional na Raízen BPA.  
-Código disponibilizado para fins de portfólio e aprendizado.
+> Projeto desenvolvido para uso interno; dados, endereços e documentos da operação foram removidos desta versão pública.
